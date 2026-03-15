@@ -30,3 +30,12 @@ go.work.sum
 # Editor/IDE
 .idea/
 # .vscode/
+
+# mTLS Certificates
+deployments/certs/*.key
+deployments/certs/*.crt
+deployments/certs/*.csr
+deployments/certs/*.ext
+deployments/certs/*.srl
+!deployments/certs/generate.ps1
+!deployments/certs/generate.sh
