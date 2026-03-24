@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 
 	"go-case-study/internal/order/handler"
 	"go-case-study/internal/order/repository"
@@ -25,6 +26,7 @@ import (
 	"go-case-study/pkg/mTLS"
 	"go-case-study/pkg/middleware"
 	"go-case-study/pkg/redis"
+	"go-case-study/pkg/tracer"
 )
 
 func main() {
@@ -35,6 +37,14 @@ func main() {
 	// 2. Initialize logger
 	logger.SetupLogger()
 	log.Println("Starting Order Service...")
+
+	// 2.5 Initialize Tracer
+	tp, err := tracer.InitTracer("order-service", cfg.OtlpEndpoint)
+	if err != nil {
+		log.Printf("Failed to initialize tracer: %v", err)
+	} else {
+		defer tp.Shutdown(context.Background())
+	}
 
 	// 3. Initialize DB
 	db, err := database.NewPostgresDB(cfg.DatabaseURL)
@@ -59,6 +69,7 @@ func main() {
 
 	// 6. Setup Router
 	router := gin.Default()
+	router.Use(otelgin.Middleware("order-service"))
 	router.Use(middleware.TraceLogger())
 	router.Use(middleware.PrometheusMetrics("order-service"))
 

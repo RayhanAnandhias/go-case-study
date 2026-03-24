@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 
 	"go-case-study/internal/payment/handler"
 	"go-case-study/internal/payment/repository"
@@ -20,6 +21,7 @@ import (
 	"go-case-study/pkg/logger"
 	"go-case-study/pkg/mTLS"
 	"go-case-study/pkg/middleware"
+	"go-case-study/pkg/tracer"
 
 	"github.com/joho/godotenv"
 )
@@ -32,6 +34,14 @@ func main() {
 	// 1.5. Initialize logger
 	logger.SetupLogger()
 	log.Println("Starting Payment Service...")
+
+	// 1.6 Initialize Tracer
+	tp, err := tracer.InitTracer("payment-service", cfg.OtlpEndpoint)
+	if err != nil {
+		log.Printf("Failed to initialize tracer: %v", err)
+	} else {
+		defer tp.Shutdown(context.Background())
+	}
 
 	// 2. Database
 	db, err := database.NewPostgresDB(cfg.DatabaseURL)
@@ -47,6 +57,7 @@ func main() {
 
 	// 4. Gin Router setup
 	router := gin.Default()
+	router.Use(otelgin.Middleware("payment-service"))
 	router.Use(middleware.TraceLogger())
 	router.Use(middleware.PrometheusMetrics("payment-service"))
 

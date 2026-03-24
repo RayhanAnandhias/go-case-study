@@ -10,7 +10,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 	"go-case-study/internal/inventory/domain"
+	pkgkafka "go-case-study/pkg/kafka"
 )
 
 var (
@@ -25,6 +28,7 @@ type KafkaWorker struct {
 	dlqWriter  *kafka.Writer
 	service    domain.InventoryService
 	workerPool int
+	tracer     trace.Tracer
 }
 
 func NewKafkaWorker(reader *kafka.Reader, dlqWriter *kafka.Writer, service domain.InventoryService, poolSize int) *KafkaWorker {
@@ -33,6 +37,7 @@ func NewKafkaWorker(reader *kafka.Reader, dlqWriter *kafka.Writer, service domai
 		dlqWriter:  dlqWriter,
 		service:    service,
 		workerPool: poolSize,
+		tracer:     otel.Tracer("inventory-service"),
 	}
 }
 
@@ -67,9 +72,17 @@ func (w *KafkaWorker) worker(ctx context.Context, wg *sync.WaitGroup, id int) {
 			continue
 		}
 
+		// Extract context from Kafka headers
+		carrier := pkgkafka.HeaderCarrier(msg.Headers)
+		msgCtx := otel.GetTextMapPropagator().Extract(ctx, &carrier)
+
+		msgCtx, span := w.tracer.Start(msgCtx, "ProcessOrderEvent")
+
 		var event domain.OrderEvent
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
 			log.Printf("Worker %d failed to unmarshal message: %v", id, err)
+			span.RecordError(err)
+			span.End()
 			// Commit poison pill to avoid getting stuck
 			_ = w.reader.CommitMessages(ctx, msg)
 			continue
@@ -78,7 +91,7 @@ func (w *KafkaWorker) worker(ctx context.Context, wg *sync.WaitGroup, id int) {
 		var processErr error
 		maxRetries := 3
 		for i := 0; i < maxRetries; i++ {
-			processErr = w.service.ProcessOrderEvent(ctx, &event)
+			processErr = w.service.ProcessOrderEvent(msgCtx, &event)
 			if processErr == nil {
 				break
 			}
@@ -88,12 +101,15 @@ func (w *KafkaWorker) worker(ctx context.Context, wg *sync.WaitGroup, id int) {
 
 		if processErr != nil {
 			log.Printf("Worker %d failed to process event %s after %d retries. Sending to DLQ.", id, event.ID, maxRetries)
+			span.RecordError(processErr)
 			// Send to DLQ
-			errDLQ := w.sendToDLQ(ctx, msg.Value)
+			errDLQ := w.sendToDLQ(msgCtx, msg.Value)
 			if errDLQ != nil {
 				log.Printf("Worker %d failed to send event %s to DLQ: %v", id, event.ID, errDLQ)
 			}
 		}
+
+		span.End()
 
 		// Commit message
 		if err := w.reader.CommitMessages(ctx, msg); err != nil {

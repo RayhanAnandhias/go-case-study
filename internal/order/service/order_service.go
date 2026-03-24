@@ -13,20 +13,29 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 
 	"go-case-study/internal/order/domain"
 	"go-case-study/internal/order/repository"
+	pkgkafka "go-case-study/pkg/kafka"
 	"go-case-study/pkg/logger"
 )
+
+type KafkaWriter interface {
+	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
+}
 
 type orderService struct {
 	repo           domain.OrderRepository
 	productRepo    domain.ProductRepository
 	redisClient    *redis.Client
 	db             *sql.DB
-	kafkaWriter    *kafka.Writer
+	kafkaWriter    KafkaWriter
 	paymentService string
 	httpClient     *http.Client
+	tracer         trace.Tracer
 }
 
 func NewOrderService(
@@ -34,10 +43,16 @@ func NewOrderService(
 	productRepo domain.ProductRepository,
 	redisClient *redis.Client,
 	db *sql.DB,
-	kafkaWriter *kafka.Writer,
+	kafkaWriter KafkaWriter,
 	paymentService string,
 	httpClient *http.Client,
 ) domain.OrderService {
+	// Wrap httpClient transport with otelhttp
+	if httpClient.Transport == nil {
+		httpClient.Transport = http.DefaultTransport
+	}
+	httpClient.Transport = otelhttp.NewTransport(httpClient.Transport)
+
 	return &orderService{
 		repo:           repo,
 		productRepo:    productRepo,
@@ -46,10 +61,14 @@ func NewOrderService(
 		kafkaWriter:    kafkaWriter,
 		paymentService: paymentService,
 		httpClient:     httpClient,
+		tracer:         otel.Tracer("order-service"),
 	}
 }
 
 func (s *orderService) CreateOrder(ctx context.Context, req domain.CreateOrderRequest) (*domain.Order, error) {
+	ctx, span := s.tracer.Start(ctx, "CreateOrder")
+	defer span.End()
+
 	// 1. Rate limiting per-user using Redis token bucket logic
 	if err := s.checkRateLimit(ctx, req.UserID); err != nil {
 		return nil, fmt.Errorf("rate limit exceeded: %w", err)
@@ -175,6 +194,9 @@ func (s *orderService) checkRateLimit(ctx context.Context, userID uuid.UUID) err
 }
 
 func (s *orderService) processPayment(ctx context.Context, order *domain.Order) error {
+	ctx, span := s.tracer.Start(ctx, "processPayment")
+	defer span.End()
+
 	payload, _ := json.Marshal(map[string]interface{}{
 		"order_id": order.ID,
 		"amount":   order.TotalAmount,
@@ -203,15 +225,23 @@ func (s *orderService) processPayment(ctx context.Context, order *domain.Order) 
 }
 
 func (s *orderService) publishOrderEvent(ctx context.Context, order *domain.Order) error {
+	ctx, span := s.tracer.Start(ctx, "publishOrderEvent")
+	defer span.End()
+
 	eventPayload, _ := json.Marshal(order)
 	msg := kafka.Message{
 		Key:   []byte(order.ID.String()),
 		Value: eventPayload,
 	}
 
-	// Optional: add trace ID to Kafka headers
+	// Inject trace context into Kafka headers
+	carrier := pkgkafka.HeaderCarrier(msg.Headers)
+	otel.GetTextMapPropagator().Inject(ctx, &carrier)
+	msg.Headers = []kafka.Header(carrier)
+
+	// Keep existing trace ID logic if needed
 	if traceID, ok := ctx.Value(logger.TraceIDKey).(string); ok {
-		msg.Headers = []kafka.Header{{Key: "trace_id", Value: []byte(traceID)}}
+		msg.Headers = append(msg.Headers, kafka.Header{Key: "trace_id", Value: []byte(traceID)})
 	}
 
 	return s.kafkaWriter.WriteMessages(ctx, msg)

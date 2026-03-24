@@ -24,6 +24,7 @@ import (
 	"go-case-study/pkg/database"
 	"go-case-study/pkg/kafka"
 	"go-case-study/pkg/logger"
+	"go-case-study/pkg/tracer"
 )
 
 func main() {
@@ -34,6 +35,14 @@ func main() {
 	// 2. Initialize logger
 	logger.SetupLogger()
 	log.Println("Starting Inventory Service...")
+
+	// 2.5 Initialize Tracer
+	tp, err := tracer.InitTracer("inventory-service", cfg.OtlpEndpoint)
+	if err != nil {
+		log.Printf("Failed to initialize tracer: %v", err)
+	} else {
+		defer tp.Shutdown(context.Background())
+	}
 
 	// 3. Initialize DB
 	db, err := database.NewPostgresDB(cfg.DatabaseURL)
